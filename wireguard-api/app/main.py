@@ -1,13 +1,23 @@
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import peers, metrics, config
+
+# Setup logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="WireGuard Management API",
     description="Simple REST API for managing WireGuard peers",
     version="1.0.0"
 )
+
+logger.info("FastAPI application initialized")
 
 # CORS middleware
 app.add_middleware(

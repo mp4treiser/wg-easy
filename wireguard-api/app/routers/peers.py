@@ -78,11 +78,19 @@ async def create_peer(peer: PeerCreate):
 @router.get("/", response_model=List[PeerResponse])
 async def list_peers():
     """Get all peers from WireGuard"""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("list_peers() endpoint called")
+    
     try:
+        logger.info("Calling wg.dump_peers()")
         wg_peers = wg.dump_peers()
+        logger.info(f"dump_peers() returned {len(wg_peers)} peers")
+        
         result = []
         
-        for wg_peer in wg_peers:
+        for i, wg_peer in enumerate(wg_peers):
+            logger.debug(f"Processing peer {i+1}/{len(wg_peers)}: {wg_peer.get('public_key', 'unknown')[:8]}...")
             public_key = wg_peer['public_key']
             metrics = wg.get_peer_metrics(public_key)
             
@@ -90,7 +98,7 @@ async def list_peers():
             stored_keys = peer_keys_store.get(public_key, {})
             name = stored_keys.get('name') or f"peer-{public_key[:8]}"
             
-            result.append(PeerResponse(
+            peer_response = PeerResponse(
                 public_key=public_key,
                 name=name,
                 ipv4_address=stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address'),
@@ -98,10 +106,14 @@ async def list_peers():
                 allowed_ips=wg_peer.get('allowed_ips', []),
                 enabled=True,
                 metrics=metrics
-            ))
+            )
+            result.append(peer_response)
+            logger.debug(f"Added peer to result: {public_key[:8]}...")
         
+        logger.info(f"list_peers() returning {len(result)} peers")
         return result
     except Exception as e:
+        logger.error(f"Exception in list_peers(): {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list peers: {str(e)}"

@@ -1,17 +1,24 @@
 import subprocess
 import re
+import logging
 from typing import Optional, List, Dict
 from datetime import datetime
 from app.models import PeerMetrics
+
+# Setup logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
 
 class WireGuardManager:
     def __init__(self, interface_name: str = "wg0", wg_executable: str = "wg"):
         self.interface_name = interface_name
         self.wg_executable = wg_executable
+        logger.info(f"WireGuardManager initialized with interface={interface_name}, executable={wg_executable}")
 
     def _exec(self, command: str) -> str:
         """Execute shell command and return output"""
+        logger.debug(f"Executing command: {command}")
         try:
             result = subprocess.run(
                 command,
@@ -20,9 +27,15 @@ class WireGuardManager:
                 text=True,
                 check=True
             )
+            logger.debug(f"Command output: {result.stdout}")
+            logger.debug(f"Command return code: {result.returncode}")
             return result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            raise Exception(f"Command failed: {command}\nError: {e.stderr}")
+            logger.error(f"Command failed: {command}")
+            logger.error(f"Return code: {e.returncode}")
+            logger.error(f"Stdout: {e.stdout}")
+            logger.error(f"Stderr: {e.stderr}")
+            raise Exception(f"Command failed: {command}\nReturn code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def generate_private_key(self) -> str:
         """Generate WireGuard private key"""
@@ -48,66 +61,95 @@ class WireGuardManager:
 
     def dump_peers(self) -> List[Dict]:
         """Get peer information from WireGuard dump"""
+        logger.info(f"dump_peers() called for interface {self.interface_name}")
         try:
-            output = self._exec(f"{self.wg_executable} show {self.interface_name} dump")
+            command = f"{self.wg_executable} show {self.interface_name} dump"
+            logger.debug(f"Executing: {command}")
+            output = self._exec(command)
+            logger.info(f"Raw dump output: {repr(output)}")
+            logger.info(f"Output length: {len(output)}")
+            
+            if not output:
+                logger.warning("Empty output from wg dump")
+                return []
+            
             peers = []
+            lines = output.strip().split('\n')
+            logger.info(f"Total lines in output: {len(lines)}")
             
-            # Skip first line (interface info)
-            lines = output.strip().split('\n')[1:]
+            # First line is interface info, skip it
+            if len(lines) > 0:
+                logger.debug(f"Interface line (skipped): {lines[0]}")
             
-            for line in lines:
+            # Process peer lines
+            for i, line in enumerate(lines[1:], start=1):
+                logger.debug(f"Processing line {i}: {repr(line)}")
                 if not line.strip():
+                    logger.debug(f"Line {i} is empty, skipping")
                     continue
                     
                 parts = line.split('\t')
+                logger.debug(f"Line {i} split into {len(parts)} parts: {parts}")
+                
                 if len(parts) < 8:
+                    logger.warning(f"Line {i} has only {len(parts)} parts, expected 8, skipping")
                     continue
                 
-                public_key = parts[0]
-                pre_shared_key = parts[1] if parts[1] != '(none)' else None
-                endpoint = parts[2] if parts[2] != '(none)' else None
-                allowed_ips = parts[3]
-                latest_handshake = parts[4]
-                transfer_rx = int(parts[5]) if parts[5].isdigit() else 0
-                transfer_tx = int(parts[6]) if parts[6].isdigit() else 0
-                persistent_keepalive = parts[7] if len(parts) > 7 else None
-                
-                # Convert handshake timestamp
-                handshake_dt = None
-                if latest_handshake and latest_handshake != '0':
-                    try:
-                        timestamp = int(latest_handshake)
-                        handshake_dt = datetime.fromtimestamp(timestamp)
-                    except (ValueError, OSError):
-                        pass
-                
-                # Parse allowed_ips to extract IP addresses
-                allowed_ips_list = [ip.strip() for ip in allowed_ips.split(',')] if allowed_ips else []
-                ipv4_address = None
-                ipv6_address = None
-                for ip in allowed_ips_list:
-                    if '/' in ip:
-                        ip_addr = ip.split('/')[0]
-                        if ':' in ip_addr:
-                            ipv6_address = ip_addr
-                        else:
-                            ipv4_address = ip_addr
-                
-                peers.append({
-                    'public_key': public_key,
-                    'pre_shared_key': pre_shared_key,
-                    'endpoint': endpoint,
-                    'allowed_ips': allowed_ips_list,
-                    'ipv4_address': ipv4_address,
-                    'ipv6_address': ipv6_address,
-                    'latest_handshake': handshake_dt,
-                    'transfer_rx': transfer_rx,
-                    'transfer_tx': transfer_tx,
-                    'persistent_keepalive': persistent_keepalive
-                })
+                try:
+                    public_key = parts[0]
+                    pre_shared_key = parts[1] if parts[1] != '(none)' else None
+                    endpoint = parts[2] if parts[2] != '(none)' else None
+                    allowed_ips = parts[3]
+                    latest_handshake = parts[4]
+                    transfer_rx = int(parts[5]) if parts[5].isdigit() else 0
+                    transfer_tx = int(parts[6]) if parts[6].isdigit() else 0
+                    persistent_keepalive = parts[7] if len(parts) > 7 else None
+                    
+                    logger.debug(f"Parsed peer: public_key={public_key[:8]}..., allowed_ips={allowed_ips}")
+                    
+                    # Convert handshake timestamp
+                    handshake_dt = None
+                    if latest_handshake and latest_handshake != '0':
+                        try:
+                            timestamp = int(latest_handshake)
+                            handshake_dt = datetime.fromtimestamp(timestamp)
+                        except (ValueError, OSError) as e:
+                            logger.warning(f"Failed to parse handshake timestamp {latest_handshake}: {e}")
+                    
+                    # Parse allowed_ips to extract IP addresses
+                    allowed_ips_list = [ip.strip() for ip in allowed_ips.split(',')] if allowed_ips else []
+                    ipv4_address = None
+                    ipv6_address = None
+                    for ip in allowed_ips_list:
+                        if '/' in ip:
+                            ip_addr = ip.split('/')[0]
+                            if ':' in ip_addr:
+                                ipv6_address = ip_addr
+                            else:
+                                ipv4_address = ip_addr
+                    
+                    peer_data = {
+                        'public_key': public_key,
+                        'pre_shared_key': pre_shared_key,
+                        'endpoint': endpoint,
+                        'allowed_ips': allowed_ips_list,
+                        'ipv4_address': ipv4_address,
+                        'ipv6_address': ipv6_address,
+                        'latest_handshake': handshake_dt,
+                        'transfer_rx': transfer_rx,
+                        'transfer_tx': transfer_tx,
+                        'persistent_keepalive': persistent_keepalive
+                    }
+                    peers.append(peer_data)
+                    logger.info(f"Successfully parsed peer: {public_key[:8]}...")
+                except Exception as e:
+                    logger.error(f"Error parsing line {i}: {e}", exc_info=True)
+                    continue
             
+            logger.info(f"dump_peers() returning {len(peers)} peers")
             return peers
         except Exception as e:
+            logger.error(f"Exception in dump_peers(): {e}", exc_info=True)
             # If interface doesn't exist or no peers, return empty list
             return []
 
@@ -206,9 +248,15 @@ class WireGuardManager:
 
     def get_interface_info(self) -> Optional[Dict]:
         """Get WireGuard interface information"""
+        logger.info(f"get_interface_info() called for interface {self.interface_name}")
         try:
-            output = self._exec(f"{self.wg_executable} show {self.interface_name}")
+            command = f"{self.wg_executable} show {self.interface_name}"
+            logger.debug(f"Executing: {command}")
+            output = self._exec(command)
+            logger.info(f"Interface show output: {repr(output)}")
+            
             lines = output.strip().split('\n')
+            logger.debug(f"Interface output has {len(lines)} lines")
             
             interface_info = {
                 'name': self.interface_name,
@@ -217,13 +265,22 @@ class WireGuardManager:
             }
             
             for line in lines:
+                logger.debug(f"Processing interface line: {line}")
                 if 'public key:' in line:
                     interface_info['public_key'] = line.split('public key:')[1].strip()
+                    logger.debug(f"Found public_key: {interface_info['public_key']}")
                 elif 'listening port:' in line:
                     interface_info['listening_port'] = int(line.split('listening port:')[1].strip())
+                    logger.debug(f"Found listening_port: {interface_info['listening_port']}")
             
-            return interface_info if interface_info['public_key'] else None
-        except Exception:
+            if interface_info['public_key']:
+                logger.info(f"Interface info retrieved: {interface_info}")
+                return interface_info
+            else:
+                logger.warning("No public key found in interface info")
+                return None
+        except Exception as e:
+            logger.error(f"Exception in get_interface_info(): {e}", exc_info=True)
             return None
     
     def add_peer(self, public_key: str, allowed_ips: List[str], 
