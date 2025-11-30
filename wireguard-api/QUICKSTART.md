@@ -1,23 +1,13 @@
-# Быстрый старт с Docker Compose
+# Быстрый старт
 
-## 1. Подготовка
-
-```bash
-cd wireguard-api
-mkdir -p data
-```
-
-## 2. Запуск
+## 1. Запуск из корневой директории проекта
 
 ```bash
-# Продакшн
+# Запуск всех сервисов (wg-easy + wireguard-api)
 docker-compose up -d
-
-# Или для разработки
-docker-compose -f docker-compose.dev.yml up
 ```
 
-## 3. Инициализация интерфейса
+## 2. Инициализация интерфейса
 
 ```bash
 curl -X POST http://localhost:8000/api/config/interface \
@@ -32,7 +22,7 @@ curl -X POST http://localhost:8000/api/config/interface \
 
 **Замените `YOUR_SERVER_IP_OR_DOMAIN` на ваш IP или домен!**
 
-## 4. Создание первого пира
+## 3. Создание первого пира
 
 ```bash
 curl -X POST http://localhost:8000/api/peers/ \
@@ -40,7 +30,7 @@ curl -X POST http://localhost:8000/api/peers/ \
   -d '{"name": "my-device"}'
 ```
 
-## 5. Получение конфигурации пира
+## 4. Получение конфигурации пира
 
 ```bash
 # Получить ID пира из предыдущего ответа, например 1

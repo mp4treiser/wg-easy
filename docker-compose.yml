@@ -1,5 +1,6 @@
 volumes:
   etc_wireguard:
+  wireguard_api_data:
 
 services:
   wg-easy:
@@ -32,6 +33,33 @@ services:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv6.conf.all.forwarding=1
       - net.ipv6.conf.default.forwarding=1
+
+  wireguard-api:
+    build:
+      context: ./wireguard-api
+      dockerfile: Dockerfile
+    container_name: wireguard-api
+    restart: unless-stopped
+    volumes:
+      # Используем тот же volume для WireGuard конфигов
+      - etc_wireguard:/etc/wireguard
+      # База данных API
+      - wireguard_api_data:/app/data
+    environment:
+      - WG_INTERFACE=wg0
+    # Нужны привилегии для работы с WireGuard
+    privileged: true
+    # Используем host network для доступа к WireGuard интерфейсу
+    # Это необходимо для работы с WireGuard интерфейсом напрямую
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - wg-easy
 
 networks:
   wg:

@@ -20,31 +20,21 @@
 
 ## Установка
 
-### Вариант 1: Docker Compose (Рекомендуется)
+### Docker Compose (Рекомендуется)
 
-1. Клонируйте или скопируйте проект:
+API интегрирован в основной `docker-compose.yml` проекта wg-easy.
 
-```bash
-cd wireguard-api
-```
-
-2. Создайте директорию для данных:
+1. Из корневой директории проекта запустите:
 
 ```bash
-mkdir -p data
-```
-
-3. Запустите через Docker Compose:
-
-```bash
-# Продакшн
 docker-compose up -d
-
-# Или для разработки (с hot reload)
-docker-compose -f docker-compose.dev.yml up
 ```
 
-4. Инициализируйте WireGuard интерфейс:
+Это запустит оба сервиса:
+- `wg-easy` - основной веб-интерфейс (порт 5000)
+- `wireguard-api` - REST API (порт 8000)
+
+2. Инициализируйте WireGuard интерфейс через API (если нужно):
 
 ```bash
 curl -X POST http://localhost:8000/api/config/interface \
@@ -57,7 +47,10 @@ curl -X POST http://localhost:8000/api/config/interface \
   }'
 ```
 
-**Важно:** Замените `your-server-ip-or-domain.com` на реальный IP адрес или домен вашего сервера.
+**Важно:** 
+- Оба сервиса используют один и тот же volume `etc_wireguard` для конфигурации WireGuard
+- Если wg-easy уже настроен, API автоматически получит доступ к существующим конфигурациям
+- Замените `your-server-ip-or-domain.com` на реальный IP адрес или домен вашего сервера
 
 ### Вариант 2: Локальная установка
 
@@ -105,19 +98,24 @@ curl -X POST http://localhost:8000/api/config/interface \
 
 ### Docker Compose
 
+Из корневой директории проекта:
+
 ```bash
-# Запуск
+# Запуск всех сервисов (wg-easy + wireguard-api)
 docker-compose up -d
 
-# Просмотр логов
+# Просмотр логов wireguard-api
+docker-compose logs -f wireguard-api
+
+# Просмотр логов всех сервисов
 docker-compose logs -f
 
 # Остановка
 docker-compose down
 
-# Пересборка
-docker-compose build
-docker-compose up -d
+# Пересборка только wireguard-api
+docker-compose build wireguard-api
+docker-compose up -d wireguard-api
 ```
 
 ### Локально (разработка)
