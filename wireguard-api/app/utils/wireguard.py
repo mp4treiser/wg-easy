@@ -11,38 +11,88 @@ logging.basicConfig(level=logging.DEBUG)
 
 
 class WireGuardManager:
-    def __init__(self, interface_name: str = "wg0", wg_executable: str = "wg"):
+    def __init__(self, interface_name: str = "wg0", wg_executable: str = "wg", 
+                 wg_container: str = None):
+        import os
         self.interface_name = interface_name
         self.wg_executable = wg_executable
-        logger.info(f"WireGuardManager initialized with interface={interface_name}, executable={wg_executable}")
+        # Get container name from environment or use default
+        self.wg_container = wg_container or os.getenv("WG_CONTAINER", "wg-easy")
+        logger.info(f"WireGuardManager initialized with interface={interface_name}, executable={wg_executable}, container={self.wg_container}")
 
-    def _exec(self, command: str) -> str:
+    def _exec(self, command: str, use_container: bool = True) -> str:
         """Execute shell command and return output"""
-        logger.debug(f"Executing command: {command}")
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            logger.debug(f"Command output: {result.stdout}")
-            logger.debug(f"Command return code: {result.returncode}")
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Command failed: {command}")
-            logger.error(f"Return code: {e.returncode}")
-            logger.error(f"Stdout: {e.stdout}")
-            logger.error(f"Stderr: {e.stderr}")
-            raise Exception(f"Command failed: {command}\nReturn code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
+        # If use_container is True, execute command inside wg-easy container
+        if use_container:
+            # Check if we're inside Docker and can access docker command
+            # If not, try direct command (for local development)
+            try:
+                # Try to execute via docker exec first
+                docker_command = f"docker exec {self.wg_container} {command}"
+                logger.debug(f"Executing command in container: {docker_command}")
+                result = subprocess.run(
+                    docker_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10
+                )
+                logger.debug(f"Command output: {result.stdout}")
+                logger.debug(f"Command return code: {result.returncode}")
+                return result.stdout.strip()
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+                # If docker exec fails, try direct command (might be running in same container or on host)
+                logger.warning(f"Docker exec failed, trying direct command: {e}")
+                try:
+                    logger.debug(f"Executing command directly: {command}")
+                    result = subprocess.run(
+                        command,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        timeout=10
+                    )
+                    logger.debug(f"Command output: {result.stdout}")
+                    logger.debug(f"Command return code: {result.returncode}")
+                    return result.stdout.strip()
+                except subprocess.CalledProcessError as e2:
+                    logger.error(f"Direct command also failed: {command}")
+                    logger.error(f"Return code: {e2.returncode}")
+                    logger.error(f"Stdout: {e2.stdout}")
+                    logger.error(f"Stderr: {e2.stderr}")
+                    raise Exception(f"Command failed: {command}\nReturn code: {e2.returncode}\nStdout: {e2.stdout}\nStderr: {e2.stderr}")
+        else:
+            # Direct execution
+            logger.debug(f"Executing command directly: {command}")
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10
+                )
+                logger.debug(f"Command output: {result.stdout}")
+                logger.debug(f"Command return code: {result.returncode}")
+                return result.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Command failed: {command}")
+                logger.error(f"Return code: {e.returncode}")
+                logger.error(f"Stdout: {e.stdout}")
+                logger.error(f"Stderr: {e.stderr}")
+                raise Exception(f"Command failed: {command}\nReturn code: {e.returncode}\nStdout: {e.stdout}\nStderr: {e.stderr}")
 
     def generate_private_key(self) -> str:
         """Generate WireGuard private key"""
-        return self._exec(f"{self.wg_executable} genkey")
+        # Generate locally, not in container
+        return self._exec(f"{self.wg_executable} genkey", use_container=False)
 
     def get_public_key(self, private_key: str) -> str:
         """Get public key from private key"""
+        # Generate locally, not in container
         process = subprocess.Popen(
             f"echo '{private_key}' | {self.wg_executable} pubkey",
             shell=True,
@@ -57,7 +107,8 @@ class WireGuardManager:
 
     def generate_pre_shared_key(self) -> str:
         """Generate pre-shared key"""
-        return self._exec(f"{self.wg_executable} genpsk")
+        # Generate locally, not in container
+        return self._exec(f"{self.wg_executable} genpsk", use_container=False)
 
     def dump_peers(self) -> List[Dict]:
         """Get peer information from WireGuard dump"""
@@ -289,23 +340,23 @@ class WireGuardManager:
         """Add a peer to WireGuard interface using wg set"""
         try:
             import subprocess
-            import tempfile
-            import os
             
             # First add the peer
             self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key}")
             
-            # Set preshared key if provided
+            # Set preshared key if provided (using stdin)
             if pre_shared_key:
-                # Create temporary file for preshared key
-                with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-                    f.write(pre_shared_key)
-                    temp_file = f.name
-                
-                try:
-                    self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} preshared-key {temp_file}")
-                finally:
-                    os.unlink(temp_file)
+                # Use echo to pipe preshared key via stdin
+                docker_cmd = f"docker exec {self.wg_container} sh -c \"echo '{pre_shared_key}' | {self.wg_executable} set {self.interface_name} peer {public_key} preshared-key /dev/stdin\""
+                logger.debug(f"Setting preshared key: {docker_cmd}")
+                result = subprocess.run(
+                    docker_cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10
+                )
             
             # Set allowed IPs
             if allowed_ips:
@@ -318,6 +369,7 @@ class WireGuardManager:
             
             return True
         except Exception as e:
+            logger.error(f"Failed to add peer: {e}", exc_info=True)
             raise Exception(f"Failed to add peer: {str(e)}")
     
     def remove_peer(self, public_key: str) -> bool:
