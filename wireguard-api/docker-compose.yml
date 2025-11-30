@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  wireguard-api:
+    build: .
+    container_name: wireguard-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount WireGuard config directory
+      - /etc/wireguard:/etc/wireguard
+      # Mount database to persist data
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - WG_INTERFACE=wg0
+    # Need privileged mode and network host for WireGuard
+    privileged: true
+    network_mode: host
+    # Alternative: use cap_add if you don't want full privileged mode
+    # cap_add:
+    #   - NET_ADMIN
+    #   - SYS_MODULE
+    # devices:
+    #   - /dev/net/tun
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
