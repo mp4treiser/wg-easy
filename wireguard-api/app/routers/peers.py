@@ -61,6 +61,8 @@ async def create_peer(peer: PeerCreate):
         
         return PeerResponse(
             public_key=public_key,
+            private_key=private_key,
+            pre_shared_key=pre_shared_key,
             name=peer.name,
             ipv4_address=ipv4_address,
             ipv6_address=peer.ipv6_address,
@@ -100,6 +102,8 @@ async def list_peers():
             
             peer_response = PeerResponse(
                 public_key=public_key,
+                private_key=stored_keys.get('private_key'),
+                pre_shared_key=stored_keys.get('pre_shared_key'),
                 name=name,
                 ipv4_address=stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address'),
                 ipv6_address=stored_keys.get('ipv6_address') or wg_peer.get('ipv6_address'),
@@ -120,9 +124,14 @@ async def list_peers():
         )
 
 
-@router.get("/{public_key}", response_model=PeerResponse)
-async def get_peer(public_key: str):
-    """Get peer by public key"""
+@router.get("/by-key", response_model=PeerResponse)
+async def get_peer_by_key(public_key: str):
+    """Get peer by public key (use query parameter to handle special characters)"""
+    from urllib.parse import unquote
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
     wg_peers = wg.dump_peers()
     peer_data = None
     
@@ -134,7 +143,7 @@ async def get_peer(public_key: str):
     if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {public_key} not found"
+            detail=f"Peer not found"
         )
     
     metrics = wg.get_peer_metrics(public_key)
@@ -145,6 +154,8 @@ async def get_peer(public_key: str):
     
     return PeerResponse(
         public_key=public_key,
+        private_key=stored_keys.get('private_key'),
+        pre_shared_key=stored_keys.get('pre_shared_key'),
         name=name,
         ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
         ipv6_address=stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
@@ -154,9 +165,14 @@ async def get_peer(public_key: str):
     )
 
 
-@router.delete("/{public_key}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/by-key", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_peer(public_key: str):
-    """Delete a peer"""
+    """Delete a peer by public key (use query parameter)"""
+    from urllib.parse import unquote
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
     try:
         wg.remove_peer(public_key)
         # Remove from keys store if exists
@@ -170,9 +186,14 @@ async def delete_peer(public_key: str):
         )
 
 
-@router.get("/{public_key}/config", response_model=PeerConfig)
+@router.get("/by-key/config", response_model=PeerConfig)
 async def get_peer_config(public_key: str):
     """Get peer configuration (keys and config parameters)"""
+    from urllib.parse import unquote
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
     wg_peers = wg.dump_peers()
     peer_data = None
     
@@ -184,7 +205,7 @@ async def get_peer_config(public_key: str):
     if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {public_key} not found"
+            detail=f"Peer not found"
         )
     
     # Get interface info
@@ -220,9 +241,14 @@ async def get_peer_config(public_key: str):
     )
 
 
-@router.get("/{public_key}/config/text", response_class=Response)
+@router.get("/by-key/config/text", response_class=Response)
 async def get_peer_config_text(public_key: str):
     """Get peer configuration as text (WireGuard config format)"""
+    from urllib.parse import unquote
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
     wg_peers = wg.dump_peers()
     peer_data = None
     
@@ -234,7 +260,7 @@ async def get_peer_config_text(public_key: str):
     if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {public_key} not found"
+            detail=f"Peer not found"
         )
     
     config = wg.read_config_file()
@@ -281,6 +307,108 @@ async def get_peer_config_text(public_key: str):
         content=config_text,
         media_type="text/plain",
         headers={
-            "Content-Disposition": f'attachment; filename="wg-peer-{public_key[:8]}.txt"'
+            "Content-Disposition": f'attachment; filename="wg-peer-{public_key[:8]}.conf"'
         }
     )
+
+
+@router.get("/by-key/qrcode")
+async def get_peer_qrcode(public_key: str, format: str = "png"):
+    """Get QR code for peer configuration (PNG or SVG)"""
+    from urllib.parse import unquote
+    import qrcode
+    import io
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
+    wg_peers = wg.dump_peers()
+    peer_data = None
+    
+    for wg_peer in wg_peers:
+        if wg_peer['public_key'] == public_key:
+            peer_data = wg_peer
+            break
+    
+    if not peer_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Peer not found"
+        )
+    
+    config = wg.read_config_file()
+    interface_info = wg.get_interface_info()
+    
+    if not config or not interface_info:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="WireGuard interface configuration not found"
+        )
+    
+    # Check if we have keys in store (peer created via this API)
+    stored_keys = peer_keys_store.get(public_key, {})
+    
+    if not stored_keys.get('private_key'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="QR code is only available for peers created via this API. Private key is required."
+        )
+    
+    # Generate client config
+    peer_dict = {
+        'private_key': stored_keys['private_key'],
+        'ipv4_address': stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
+        'ipv6_address': stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
+        'allowed_ips': ['0.0.0.0/0'],  # Default for client
+        'pre_shared_key': stored_keys.get('pre_shared_key'),
+        'persistent_keepalive': peer_data.get('persistent_keepalive')
+    }
+    
+    interface_dict = {
+        'public_key': interface_info['public_key'],
+        'port': interface_info.get('listening_port', 51820),
+        'dns': config.get('dns') if config else None
+    }
+    
+    config_text = wg.generate_client_config(peer_dict, interface_dict)
+    
+    # Generate QR code
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(config_text)
+    qr.make(fit=True)
+    
+    if format.lower() == "svg":
+        # Generate SVG
+        import qrcode.image.svg
+        factory = qrcode.image.svg.SvgImage
+        img = qr.make_image(image_factory=factory)
+        output = io.BytesIO()
+        img.save(output)
+        output.seek(0)
+        
+        return Response(
+            content=output.getvalue(),
+            media_type="image/svg+xml",
+            headers={
+                "Content-Disposition": f'inline; filename="wg-peer-{public_key[:8]}.svg"'
+            }
+        )
+    else:
+        # Generate PNG (default)
+        img = qr.make_image(fill_color="black", back_color="white")
+        output = io.BytesIO()
+        img.save(output, format='PNG')
+        output.seek(0)
+        
+        return Response(
+            content=output.getvalue(),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'inline; filename="wg-peer-{public_key[:8]}.png"'
+            }
+        )

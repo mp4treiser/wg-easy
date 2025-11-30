@@ -70,9 +70,14 @@ async def get_all_metrics():
         )
 
 
-@router.get("/{public_key}", response_model=MetricsResponse)
+@router.get("/by-key", response_model=MetricsResponse)
 async def get_peer_metrics(public_key: str):
-    """Get metrics for a specific peer"""
+    """Get metrics for a specific peer (use query parameter)"""
+    from urllib.parse import unquote
+    
+    # Decode URL-encoded key
+    public_key = unquote(public_key)
+    
     wg_peers = wg.dump_peers()
     peer_found = False
     
@@ -84,7 +89,7 @@ async def get_peer_metrics(public_key: str):
     if not peer_found:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {public_key} not found"
+            detail=f"Peer not found"
         )
     
     metrics = wg.get_peer_metrics(public_key)

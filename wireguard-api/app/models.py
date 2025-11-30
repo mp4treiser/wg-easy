@@ -49,6 +49,8 @@ class Peer(PeerBase):
 
 class PeerResponse(BaseModel):
     public_key: str
+    private_key: Optional[str] = None  # Only if peer was created via this API
+    pre_shared_key: Optional[str] = None  # Only if peer was created via this API
     name: Optional[str] = None
     ipv4_address: Optional[str] = None
     ipv6_address: Optional[str] = None
