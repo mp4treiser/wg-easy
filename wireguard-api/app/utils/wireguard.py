@@ -81,11 +81,25 @@ class WireGuardManager:
                     except (ValueError, OSError):
                         pass
                 
+                # Parse allowed_ips to extract IP addresses
+                allowed_ips_list = [ip.strip() for ip in allowed_ips.split(',')] if allowed_ips else []
+                ipv4_address = None
+                ipv6_address = None
+                for ip in allowed_ips_list:
+                    if '/' in ip:
+                        ip_addr = ip.split('/')[0]
+                        if ':' in ip_addr:
+                            ipv6_address = ip_addr
+                        else:
+                            ipv4_address = ip_addr
+                
                 peers.append({
                     'public_key': public_key,
                     'pre_shared_key': pre_shared_key,
                     'endpoint': endpoint,
-                    'allowed_ips': allowed_ips,
+                    'allowed_ips': allowed_ips_list,
+                    'ipv4_address': ipv4_address,
+                    'ipv6_address': ipv6_address,
                     'latest_handshake': handshake_dt,
                     'transfer_rx': transfer_rx,
                     'transfer_tx': transfer_tx,

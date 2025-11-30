@@ -59,22 +59,54 @@ async def create_peer(peer: PeerCreate):
 
 @router.get("/", response_model=List[PeerResponse])
 async def list_peers():
-    """Get all peers"""
+    """Get all peers from WireGuard (reads directly from WireGuard, not just from API database)"""
     try:
-        peers = await db.get_all_peers()
-        result = []
+        # Get peers directly from WireGuard
+        wg_peers = wg.dump_peers()
         
-        for peer in peers:
-            metrics = wg.get_peer_metrics(peer.public_key)
+        # Get peers from API database to match names and additional info
+        db_peers = await db.get_all_peers()
+        db_peers_by_key = {p.public_key: p for p in db_peers}
+        
+        result = []
+        peer_counter = 1
+        
+        for wg_peer in wg_peers:
+            public_key = wg_peer['public_key']
+            db_peer = db_peers_by_key.get(public_key)
+            
+            # Use info from DB if available, otherwise use WireGuard data
+            if db_peer:
+                name = db_peer.name
+                ipv4_address = db_peer.ipv4_address
+                ipv6_address = db_peer.ipv6_address
+                enabled = db_peer.enabled
+                created_at = db_peer.created_at
+                updated_at = db_peer.updated_at
+                peer_id = db_peer.id
+            else:
+                # Peer exists in WireGuard but not in API DB (created via wg-easy)
+                name = f"peer-{public_key[:8]}"
+                ipv4_address = wg_peer.get('ipv4_address')
+                ipv6_address = wg_peer.get('ipv6_address')
+                enabled = True
+                from datetime import datetime
+                created_at = datetime.now()
+                updated_at = datetime.now()
+                peer_id = peer_counter
+                peer_counter += 1
+            
+            metrics = wg.get_peer_metrics(public_key)
+            
             result.append(PeerResponse(
-                id=peer.id,
-                name=peer.name,
-                public_key=peer.public_key,
-                ipv4_address=peer.ipv4_address,
-                ipv6_address=peer.ipv6_address,
-                enabled=peer.enabled,
-                created_at=peer.created_at,
-                updated_at=peer.updated_at,
+                id=peer_id,
+                name=name,
+                public_key=public_key,
+                ipv4_address=ipv4_address,
+                ipv6_address=ipv6_address,
+                enabled=enabled,
+                created_at=created_at,
+                updated_at=updated_at,
                 metrics=metrics
             ))
         
