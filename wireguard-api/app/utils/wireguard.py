@@ -282,9 +282,15 @@ class WireGuardManager:
         config += f"PublicKey = {interface['public_key']}\n"
         config += f"PresharedKey = {peer['pre_shared_key']}\n"
         
+        # For client config, use stored allowed_ips (should be 0.0.0.0/0 for internet access)
+        # or default to 0.0.0.0/0 if not specified
         allowed_ips = peer.get('allowed_ips', ['0.0.0.0/0'])
         if isinstance(allowed_ips, str):
             allowed_ips = allowed_ips.split(',')
+        # Ensure 0.0.0.0/0 is included for internet access unless explicitly restricted
+        if not any('0.0.0.0/0' in ip for ip in allowed_ips):
+            # If no 0.0.0.0/0, add it first (client needs internet access)
+            allowed_ips = ['0.0.0.0/0'] + allowed_ips
         config += f"AllowedIPs = {', '.join(allowed_ips)}\n"
         
         if peer.get('persistent_keepalive'):
@@ -337,11 +343,11 @@ class WireGuardManager:
     def add_peer(self, public_key: str, allowed_ips: List[str], 
                  pre_shared_key: Optional[str] = None, 
                  persistent_keepalive: Optional[int] = None) -> bool:
-        """Add a peer to WireGuard interface using wg set"""
+        """Add a peer to WireGuard interface using wg set and save to config file"""
         try:
             import subprocess
             
-            # First add the peer
+            # First add the peer via wg set
             self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key}")
             
             # Set preshared key if provided (using stdin)
@@ -367,18 +373,161 @@ class WireGuardManager:
             if persistent_keepalive:
                 self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} persistent-keepalive {persistent_keepalive}")
             
+            # Now save to config file and sync
+            self._save_peer_to_config(public_key, allowed_ips, pre_shared_key, persistent_keepalive)
+            self._sync_config()
+            
             return True
         except Exception as e:
             logger.error(f"Failed to add peer: {e}", exc_info=True)
             raise Exception(f"Failed to add peer: {str(e)}")
     
-    def remove_peer(self, public_key: str) -> bool:
-        """Remove a peer from WireGuard interface"""
+    def _save_peer_to_config(self, public_key: str, allowed_ips: List[str],
+                             pre_shared_key: Optional[str] = None,
+                             persistent_keepalive: Optional[int] = None):
+        """Append peer configuration to WireGuard config file"""
         try:
+            config_path = f"/etc/wireguard/{self.interface_name}.conf"
+            
+            # Read existing config
+            with open(config_path, 'r') as f:
+                content = f.read()
+            
+            # Generate peer config block
+            peer_config = "\n[Peer]\n"
+            peer_config += f"PublicKey = {public_key}\n"
+            
+            if pre_shared_key:
+                peer_config += f"PresharedKey = {pre_shared_key}\n"
+            
+            if allowed_ips:
+                allowed_ips_str = ', '.join(allowed_ips)
+                peer_config += f"AllowedIPs = {allowed_ips_str}\n"
+            
+            if persistent_keepalive:
+                peer_config += f"PersistentKeepalive = {persistent_keepalive}\n"
+            
+            # Append peer config to file (inside container)
+            docker_cmd = f"docker exec {self.wg_container} sh -c \"echo '{peer_config}' >> {config_path}\""
+            logger.debug(f"Appending peer to config: {docker_cmd}")
+            subprocess.run(
+                docker_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
+            )
+            
+            logger.info(f"Peer configuration saved to {config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save peer to config file (will continue): {e}")
+            # Don't fail if we can't write to config file, wg set already applied changes
+    
+    def _sync_config(self):
+        """Sync WireGuard configuration using syncconf"""
+        try:
+            # Use wg syncconf to apply config file changes without restarting
+            # This reads from config file and applies changes
+            docker_cmd = f"docker exec {self.wg_container} sh -c \"{self.wg_executable} syncconf {self.interface_name} <({self.wg_executable}-quick strip {self.interface_name})\""
+            logger.debug(f"Syncing config: {docker_cmd}")
+            subprocess.run(
+                docker_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
+            )
+            logger.info("Config synced successfully")
+        except Exception as e:
+            logger.warning(f"Failed to sync config (will continue): {e}")
+            # Don't fail if sync fails, changes are already applied via wg set
+    
+    def remove_peer(self, public_key: str) -> bool:
+        """Remove a peer from WireGuard interface and config file"""
+        try:
+            import subprocess
+            
+            # Remove via wg set
             self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} remove")
+            
+            # Remove from config file
+            self._remove_peer_from_config(public_key)
+            
+            # Sync config
+            self._sync_config()
+            
             return True
         except Exception as e:
             raise Exception(f"Failed to remove peer: {str(e)}")
+    
+    def _remove_peer_from_config(self, public_key: str):
+        """Remove peer configuration from WireGuard config file"""
+        try:
+            import subprocess
+            config_path = f"/etc/wireguard/{self.interface_name}.conf"
+            
+            # Read config file inside container
+            docker_cmd_read = f"docker exec {self.wg_container} cat {config_path}"
+            result = subprocess.run(
+                docker_cmd_read,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
+            )
+            content = result.stdout
+            
+            # Remove peer block
+            lines = content.split('\n')
+            new_lines = []
+            skip_peer = False
+            
+            for line in lines:
+                if line.strip() == '[Peer]':
+                    skip_peer = True
+                    # Check if this peer matches
+                    continue
+                elif skip_peer:
+                    if line.strip().startswith('PublicKey = '):
+                        peer_key = line.split('=', 1)[1].strip()
+                        if peer_key == public_key:
+                            # Skip this entire peer block
+                            continue
+                        else:
+                            # Different peer, keep it
+                            new_lines.append('[Peer]')
+                            new_lines.append(line)
+                            skip_peer = False
+                    elif line.strip() and not line.strip().startswith('PublicKey') and not line.strip().startswith('PresharedKey') and not line.strip().startswith('AllowedIPs') and not line.strip().startswith('PersistentKeepalive') and not line.strip().startswith('Endpoint'):
+                        # End of peer block or start of new section
+                        if not line.strip().startswith('['):
+                            new_lines.append('[Peer]')
+                        new_lines.append(line)
+                        skip_peer = False
+                    else:
+                        # Part of peer block, but not the one we're removing
+                        new_lines.append(line)
+                else:
+                    new_lines.append(line)
+            
+            # Write back to file
+            new_content = '\n'.join(new_lines)
+            docker_cmd_write = f"docker exec {self.wg_container} sh -c \"cat > {config_path} << 'EOF'\n{new_content}\nEOF\""
+            subprocess.run(
+                docker_cmd_write,
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10
+            )
+            
+            logger.info(f"Peer removed from config file")
+        except Exception as e:
+            logger.warning(f"Failed to remove peer from config file (will continue): {e}")
     
     def get_next_available_ip(self, cidr: str = "10.8.0.0/24") -> str:
         """Get next available IP address from CIDR"""

@@ -7,6 +7,16 @@ router = APIRouter()
 wg = WireGuardManager()
 
 
+def _parse_persistent_keepalive(value):
+    """Parse persistent keepalive value, handling 'off' and None"""
+    if not value or value == 'off' or value == '(none)':
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
 @router.post("/", response_model=PeerResponse, status_code=status.HTTP_201_CREATED)
 async def create_peer(peer: PeerCreate):
     """Create a new WireGuard peer"""
@@ -34,15 +44,20 @@ async def create_peer(peer: PeerCreate):
             
             ipv4_address = wg.get_next_available_ip(cidr)
         
-        # Build allowed IPs
-        allowed_ips = peer.allowed_ips if peer.allowed_ips else [f"{ipv4_address}/32"]
+        # Build allowed IPs for server side (should be the client's IP)
+        # For server: allowed_ips = client's IP/32 (so server knows which IP to assign)
+        # For client config: allowed_ips = 0.0.0.0/0 (so client can access internet)
+        server_allowed_ips = peer.allowed_ips if peer.allowed_ips else [f"{ipv4_address}/32"]
         if peer.ipv6_address:
-            allowed_ips.append(f"{peer.ipv6_address}/128")
+            server_allowed_ips.append(f"{peer.ipv6_address}/128")
         
-        # Add peer to WireGuard
+        # Store client allowed_ips separately (for client config generation)
+        client_allowed_ips = peer.allowed_ips if peer.allowed_ips else ['0.0.0.0/0']
+        
+        # Add peer to WireGuard (server side - uses client's IP)
         wg.add_peer(
             public_key=public_key,
-            allowed_ips=allowed_ips,
+            allowed_ips=server_allowed_ips,
             pre_shared_key=pre_shared_key,
             persistent_keepalive=peer.persistent_keepalive
         )
@@ -53,7 +68,8 @@ async def create_peer(peer: PeerCreate):
             'pre_shared_key': pre_shared_key,
             'name': peer.name,
             'ipv4_address': ipv4_address,
-            'ipv6_address': peer.ipv6_address
+            'ipv6_address': peer.ipv6_address,
+            'allowed_ips': client_allowed_ips  # Store client allowed_ips for config generation
         }
         
         # Get metrics if available
@@ -66,7 +82,7 @@ async def create_peer(peer: PeerCreate):
             name=peer.name,
             ipv4_address=ipv4_address,
             ipv6_address=peer.ipv6_address,
-            allowed_ips=allowed_ips,
+            allowed_ips=client_allowed_ips,  # Return client allowed_ips
             enabled=True,
             metrics=metrics
         )
@@ -190,19 +206,27 @@ async def delete_peer(public_key: str):
 async def get_peer_config(public_key: str):
     """Get peer configuration (keys and config parameters)"""
     from urllib.parse import unquote
+    import logging
+    logger = logging.getLogger(__name__)
     
     # Decode URL-encoded key
     public_key = unquote(public_key)
+    logger.info(f"get_peer_config called with public_key: {public_key[:20]}...")
     
     wg_peers = wg.dump_peers()
-    peer_data = None
+    logger.info(f"dump_peers returned {len(wg_peers)} peers")
     
+    peer_data = None
     for wg_peer in wg_peers:
+        logger.debug(f"Comparing: {wg_peer['public_key'][:20]}... == {public_key[:20]}...")
         if wg_peer['public_key'] == public_key:
             peer_data = wg_peer
+            logger.info(f"Found peer: {public_key[:20]}...")
             break
     
     if not peer_data:
+        logger.warning(f"Peer not found: {public_key[:20]}...")
+        logger.warning(f"Available peers: {[p['public_key'][:20] + '...' for p in wg_peers]}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Peer not found"
@@ -233,7 +257,7 @@ async def get_peer_config(public_key: str):
         ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
         ipv6_address=stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
         allowed_ips=allowed_ips,
-        persistent_keepalive=int(peer_data.get('persistent_keepalive', 0)) if peer_data.get('persistent_keepalive') else None,
+        persistent_keepalive=_parse_persistent_keepalive(peer_data.get('persistent_keepalive')),
         server_public_key=interface_info['public_key'],
         server_endpoint=None,  # Not available from WireGuard dump
         server_port=interface_info.get('listening_port', 51820),
@@ -245,19 +269,27 @@ async def get_peer_config(public_key: str):
 async def get_peer_config_text(public_key: str):
     """Get peer configuration as text (WireGuard config format)"""
     from urllib.parse import unquote
+    import logging
+    logger = logging.getLogger(__name__)
     
     # Decode URL-encoded key
     public_key = unquote(public_key)
+    logger.info(f"get_peer_config_text called with public_key: {public_key[:20]}...")
     
     wg_peers = wg.dump_peers()
-    peer_data = None
+    logger.info(f"dump_peers returned {len(wg_peers)} peers")
     
+    peer_data = None
     for wg_peer in wg_peers:
+        logger.debug(f"Comparing: {wg_peer['public_key'][:20]}... == {public_key[:20]}...")
         if wg_peer['public_key'] == public_key:
             peer_data = wg_peer
+            logger.info(f"Found peer: {public_key[:20]}...")
             break
     
     if not peer_data:
+        logger.warning(f"Peer not found: {public_key[:20]}...")
+        logger.warning(f"Available peers: {[p['public_key'][:20] + '...' for p in wg_peers]}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Peer not found"
@@ -281,9 +313,9 @@ async def get_peer_config_text(public_key: str):
             'private_key': stored_keys['private_key'],
             'ipv4_address': stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
             'ipv6_address': stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
-            'allowed_ips': ['0.0.0.0/0'],  # Default for client
+            'allowed_ips': stored_keys.get('allowed_ips', ['0.0.0.0/0']),  # Use stored client allowed_ips
             'pre_shared_key': stored_keys.get('pre_shared_key'),
-            'persistent_keepalive': peer_data.get('persistent_keepalive')
+            'persistent_keepalive': _parse_persistent_keepalive(peer_data.get('persistent_keepalive'))
         }
         
         interface_dict = {
@@ -318,19 +350,27 @@ async def get_peer_qrcode(public_key: str, format: str = "png"):
     from urllib.parse import unquote
     import qrcode
     import io
+    import logging
+    logger = logging.getLogger(__name__)
     
     # Decode URL-encoded key
     public_key = unquote(public_key)
+    logger.info(f"get_peer_qrcode called with public_key: {public_key[:20]}...")
     
     wg_peers = wg.dump_peers()
-    peer_data = None
+    logger.info(f"dump_peers returned {len(wg_peers)} peers")
     
+    peer_data = None
     for wg_peer in wg_peers:
+        logger.debug(f"Comparing: {wg_peer['public_key'][:20]}... == {public_key[:20]}...")
         if wg_peer['public_key'] == public_key:
             peer_data = wg_peer
+            logger.info(f"Found peer: {public_key[:20]}...")
             break
     
     if not peer_data:
+        logger.warning(f"Peer not found: {public_key[:20]}...")
+        logger.warning(f"Available peers: {[p['public_key'][:20] + '...' for p in wg_peers]}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Peer not found"
@@ -359,9 +399,9 @@ async def get_peer_qrcode(public_key: str, format: str = "png"):
         'private_key': stored_keys['private_key'],
         'ipv4_address': stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
         'ipv6_address': stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
-        'allowed_ips': ['0.0.0.0/0'],  # Default for client
+        'allowed_ips': stored_keys.get('allowed_ips', ['0.0.0.0/0']),  # Use stored client allowed_ips
         'pre_shared_key': stored_keys.get('pre_shared_key'),
-        'persistent_keepalive': peer_data.get('persistent_keepalive')
+        'persistent_keepalive': _parse_persistent_keepalive(peer_data.get('persistent_keepalive'))
     }
     
     interface_dict = {
