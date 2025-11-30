@@ -1,24 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 
 from app.routers import peers, metrics, config
-from app.database import db
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    await db.init_db()
-    yield
-    # Shutdown (if needed)
-
 
 app = FastAPI(
     title="WireGuard Management API",
     description="Simple REST API for managing WireGuard peers",
-    version="1.0.0",
-    lifespan=lifespan
+    version="1.0.0"
 )
 
 # CORS middleware

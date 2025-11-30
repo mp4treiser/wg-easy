@@ -1,6 +1,5 @@
 volumes:
   etc_wireguard:
-  wireguard_api_data:
 
 services:
   wg-easy:
@@ -43,8 +42,6 @@ services:
     volumes:
       # Используем тот же volume для WireGuard конфигов
       - etc_wireguard:/etc/wireguard
-      # База данных API
-      - wireguard_api_data:/app/data
     environment:
       - WG_INTERFACE=wg0
     # Нужны привилегии для работы с WireGuard

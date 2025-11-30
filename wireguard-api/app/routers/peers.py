@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, status, Response
 from typing import List
-from app.models import PeerCreate, PeerResponse, PeerConfig
-from app.database import db
+from app.models import PeerCreate, PeerResponse, PeerConfig, peer_keys_store
 from app.utils.wireguard import WireGuardManager
 
 router = APIRouter()
@@ -21,33 +20,52 @@ async def create_peer(peer: PeerCreate):
         if peer.ipv4_address:
             ipv4_address = peer.ipv4_address
         else:
-            ipv4_address = await db.get_next_ipv4()
+            # Try to get CIDR from config file
+            config = wg.read_config_file()
+            if config and config.get('address'):
+                # Extract CIDR from address
+                address = config['address'].split(',')[0]  # Take first address
+                if '/' in address:
+                    cidr = '.'.join(address.split('/')[0].split('.')[:3]) + '.0/24'
+                else:
+                    cidr = "10.8.0.0/24"
+            else:
+                cidr = "10.8.0.0/24"
+            
+            ipv4_address = wg.get_next_available_ip(cidr)
         
-        # Create peer in database
-        created_peer = await db.create_peer(
-            peer=peer,
-            private_key=private_key,
+        # Build allowed IPs
+        allowed_ips = peer.allowed_ips if peer.allowed_ips else [f"{ipv4_address}/32"]
+        if peer.ipv6_address:
+            allowed_ips.append(f"{peer.ipv6_address}/128")
+        
+        # Add peer to WireGuard
+        wg.add_peer(
             public_key=public_key,
+            allowed_ips=allowed_ips,
             pre_shared_key=pre_shared_key,
-            ipv4_address=ipv4_address,
-            ipv6_address=peer.ipv6_address
+            persistent_keepalive=peer.persistent_keepalive
         )
         
-        # Update WireGuard configuration
-        await update_wireguard_config()
+        # Store keys in memory (only for peers created via this API)
+        peer_keys_store[public_key] = {
+            'private_key': private_key,
+            'pre_shared_key': pre_shared_key,
+            'name': peer.name,
+            'ipv4_address': ipv4_address,
+            'ipv6_address': peer.ipv6_address
+        }
         
         # Get metrics if available
         metrics = wg.get_peer_metrics(public_key)
         
         return PeerResponse(
-            id=created_peer.id,
-            name=created_peer.name,
-            public_key=created_peer.public_key,
-            ipv4_address=created_peer.ipv4_address,
-            ipv6_address=created_peer.ipv6_address,
-            enabled=created_peer.enabled,
-            created_at=created_peer.created_at,
-            updated_at=created_peer.updated_at,
+            public_key=public_key,
+            name=peer.name,
+            ipv4_address=ipv4_address,
+            ipv6_address=peer.ipv6_address,
+            allowed_ips=allowed_ips,
+            enabled=True,
             metrics=metrics
         )
     except Exception as e:
@@ -59,54 +77,26 @@ async def create_peer(peer: PeerCreate):
 
 @router.get("/", response_model=List[PeerResponse])
 async def list_peers():
-    """Get all peers from WireGuard (reads directly from WireGuard, not just from API database)"""
+    """Get all peers from WireGuard"""
     try:
-        # Get peers directly from WireGuard
         wg_peers = wg.dump_peers()
-        
-        # Get peers from API database to match names and additional info
-        db_peers = await db.get_all_peers()
-        db_peers_by_key = {p.public_key: p for p in db_peers}
-        
         result = []
-        peer_counter = 1
         
         for wg_peer in wg_peers:
             public_key = wg_peer['public_key']
-            db_peer = db_peers_by_key.get(public_key)
-            
-            # Use info from DB if available, otherwise use WireGuard data
-            if db_peer:
-                name = db_peer.name
-                ipv4_address = db_peer.ipv4_address
-                ipv6_address = db_peer.ipv6_address
-                enabled = db_peer.enabled
-                created_at = db_peer.created_at
-                updated_at = db_peer.updated_at
-                peer_id = db_peer.id
-            else:
-                # Peer exists in WireGuard but not in API DB (created via wg-easy)
-                name = f"peer-{public_key[:8]}"
-                ipv4_address = wg_peer.get('ipv4_address')
-                ipv6_address = wg_peer.get('ipv6_address')
-                enabled = True
-                from datetime import datetime
-                created_at = datetime.now()
-                updated_at = datetime.now()
-                peer_id = peer_counter
-                peer_counter += 1
-            
             metrics = wg.get_peer_metrics(public_key)
             
+            # Get name from store if peer was created via this API
+            stored_keys = peer_keys_store.get(public_key, {})
+            name = stored_keys.get('name') or f"peer-{public_key[:8]}"
+            
             result.append(PeerResponse(
-                id=peer_id,
-                name=name,
                 public_key=public_key,
-                ipv4_address=ipv4_address,
-                ipv6_address=ipv6_address,
-                enabled=enabled,
-                created_at=created_at,
-                updated_at=updated_at,
+                name=name,
+                ipv4_address=stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address'),
+                ipv6_address=stored_keys.get('ipv6_address') or wg_peer.get('ipv6_address'),
+                allowed_ips=wg_peer.get('allowed_ips', []),
+                enabled=True,
                 metrics=metrics
             ))
         
@@ -118,172 +108,167 @@ async def list_peers():
         )
 
 
-@router.get("/{peer_id}", response_model=PeerResponse)
-async def get_peer(peer_id: int):
-    """Get peer by ID"""
-    peer = await db.get_peer(peer_id)
-    if not peer:
+@router.get("/{public_key}", response_model=PeerResponse)
+async def get_peer(public_key: str):
+    """Get peer by public key"""
+    wg_peers = wg.dump_peers()
+    peer_data = None
+    
+    for wg_peer in wg_peers:
+        if wg_peer['public_key'] == public_key:
+            peer_data = wg_peer
+            break
+    
+    if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {peer_id} not found"
+            detail=f"Peer {public_key} not found"
         )
     
-    metrics = wg.get_peer_metrics(peer.public_key)
+    metrics = wg.get_peer_metrics(public_key)
+    
+    # Get name from store if peer was created via this API
+    stored_keys = peer_keys_store.get(public_key, {})
+    name = stored_keys.get('name') or f"peer-{public_key[:8]}"
     
     return PeerResponse(
-        id=peer.id,
-        name=peer.name,
-        public_key=peer.public_key,
-        ipv4_address=peer.ipv4_address,
-        ipv6_address=peer.ipv6_address,
-        enabled=peer.enabled,
-        created_at=peer.created_at,
-        updated_at=peer.updated_at,
+        public_key=public_key,
+        name=name,
+        ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
+        ipv6_address=stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
+        allowed_ips=peer_data.get('allowed_ips', []),
+        enabled=True,
         metrics=metrics
     )
 
 
-@router.delete("/{peer_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_peer(peer_id: int):
+@router.delete("/{public_key}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_peer(public_key: str):
     """Delete a peer"""
-    peer = await db.get_peer(peer_id)
-    if not peer:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {peer_id} not found"
-        )
-    
-    deleted = await db.delete_peer(peer_id)
-    if not deleted:
+    try:
+        wg.remove_peer(public_key)
+        # Remove from keys store if exists
+        if public_key in peer_keys_store:
+            del peer_keys_store[public_key]
+        return None
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete peer"
+            detail=f"Failed to delete peer: {str(e)}"
         )
-    
-    # Update WireGuard configuration
-    await update_wireguard_config()
-    
-    return None
 
 
-@router.get("/{peer_id}/config", response_model=PeerConfig)
-async def get_peer_config(peer_id: int):
+@router.get("/{public_key}/config", response_model=PeerConfig)
+async def get_peer_config(public_key: str):
     """Get peer configuration (keys and config parameters)"""
-    peer = await db.get_peer(peer_id)
-    if not peer:
+    wg_peers = wg.dump_peers()
+    peer_data = None
+    
+    for wg_peer in wg_peers:
+        if wg_peer['public_key'] == public_key:
+            peer_data = wg_peer
+            break
+    
+    if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {peer_id} not found"
+            detail=f"Peer {public_key} not found"
         )
     
-    interface = await db.get_interface()
-    if not interface:
+    # Get interface info
+    interface_info = wg.get_interface_info()
+    config = wg.read_config_file()
+    
+    if not interface_info:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="WireGuard interface not configured"
+            detail="WireGuard interface not found"
         )
     
-    allowed_ips = peer.allowed_ips if peer.allowed_ips else ['0.0.0.0/0']
+    allowed_ips = peer_data.get('allowed_ips', ['0.0.0.0/0'])
     dns = None
-    if interface.get('dns'):
-        dns = interface['dns'].split(',') if isinstance(interface['dns'], str) else interface['dns']
+    if config and config.get('dns'):
+        dns = [d.strip() for d in config['dns'].split(',')]
+    
+    # Check if we have keys in store (peer created via this API)
+    stored_keys = peer_keys_store.get(public_key, {})
     
     return PeerConfig(
-        private_key=peer.private_key,
-        public_key=peer.public_key,
-        pre_shared_key=peer.pre_shared_key,
-        ipv4_address=peer.ipv4_address,
-        ipv6_address=peer.ipv6_address,
+        private_key=stored_keys.get('private_key'),  # Only if created via this API
+        public_key=public_key,
+        pre_shared_key=stored_keys.get('pre_shared_key') or peer_data.get('pre_shared_key'),
+        ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
+        ipv6_address=stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
         allowed_ips=allowed_ips,
-        persistent_keepalive=peer.persistent_keepalive,
-        server_public_key=interface['public_key'],
-        server_endpoint=interface.get('endpoint', ''),
-        server_port=interface.get('port', 51820),
+        persistent_keepalive=int(peer_data.get('persistent_keepalive', 0)) if peer_data.get('persistent_keepalive') else None,
+        server_public_key=interface_info['public_key'],
+        server_endpoint=None,  # Not available from WireGuard dump
+        server_port=interface_info.get('listening_port', 51820),
         dns=dns
     )
 
 
-@router.get("/{peer_id}/config/text", response_class=Response)
-async def get_peer_config_text(peer_id: int):
+@router.get("/{public_key}/config/text", response_class=Response)
+async def get_peer_config_text(public_key: str):
     """Get peer configuration as text (WireGuard config format)"""
-    peer = await db.get_peer(peer_id)
-    if not peer:
+    wg_peers = wg.dump_peers()
+    peer_data = None
+    
+    for wg_peer in wg_peers:
+        if wg_peer['public_key'] == public_key:
+            peer_data = wg_peer
+            break
+    
+    if not peer_data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Peer {peer_id} not found"
+            detail=f"Peer {public_key} not found"
         )
     
-    interface = await db.get_interface()
-    if not interface:
+    config = wg.read_config_file()
+    interface_info = wg.get_interface_info()
+    
+    if not config or not interface_info:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="WireGuard interface not configured"
+            detail="WireGuard interface configuration not found"
         )
     
-    peer_dict = {
-        'private_key': peer.private_key,
-        'ipv4_address': peer.ipv4_address,
-        'ipv6_address': peer.ipv6_address,
-        'allowed_ips': peer.allowed_ips if peer.allowed_ips else ['0.0.0.0/0'],
-        'pre_shared_key': peer.pre_shared_key,
-        'persistent_keepalive': peer.persistent_keepalive
-    }
+    # Check if we have keys in store (peer created via this API)
+    stored_keys = peer_keys_store.get(public_key, {})
     
-    config_text = wg.generate_client_config(peer_dict, interface)
+    if stored_keys.get('private_key'):
+        # Generate full client config
+        peer_dict = {
+            'private_key': stored_keys['private_key'],
+            'ipv4_address': stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
+            'ipv6_address': stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
+            'allowed_ips': ['0.0.0.0/0'],  # Default for client
+            'pre_shared_key': stored_keys.get('pre_shared_key'),
+            'persistent_keepalive': peer_data.get('persistent_keepalive')
+        }
+        
+        interface_dict = {
+            'public_key': interface_info['public_key'],
+            'port': interface_info.get('listening_port', 51820),
+            'dns': config.get('dns') if config else None
+        }
+        
+        config_text = wg.generate_client_config(peer_dict, interface_dict)
+    else:
+        # Can't generate full config without private key
+        config_text = f"# Peer: {public_key[:8]}...\n"
+        config_text += f"# Public Key: {public_key}\n"
+        config_text += f"# Allowed IPs: {', '.join(peer_data.get('allowed_ips', []))}\n"
+        config_text += f"# Server Public Key: {interface_info['public_key']}\n"
+        config_text += f"# Server Port: {interface_info.get('listening_port', 51820)}\n"
+        config_text += "\n# Note: Full client config is only available for peers created via this API.\n"
+        config_text += "# Private key is not stored for peers created through wg-easy.\n"
     
     return Response(
         content=config_text,
         media_type="text/plain",
         headers={
-            "Content-Disposition": f'attachment; filename="wg-{peer.name}.conf"'
+            "Content-Disposition": f'attachment; filename="wg-peer-{public_key[:8]}.txt"'
         }
     )
-
-
-async def update_wireguard_config():
-    """Update WireGuard configuration file and sync"""
-    try:
-        interface = await db.get_interface()
-        if not interface:
-            raise Exception("Interface not configured")
-        
-        peers = await db.get_all_peers()
-        enabled_peers = [p for p in peers if p.enabled]
-        
-        # Generate interface section
-        config_lines = [
-            "[Interface]",
-            f"PrivateKey = {interface['private_key']}",
-            f"Address = {interface['ipv4_cidr'].split('/')[0].rsplit('.', 1)[0]}.1/{interface['ipv4_cidr'].split('/')[1]}",
-            f"ListenPort = {interface['port']}",
-            "",
-        ]
-        
-        # Add peer sections
-        for peer in enabled_peers:
-            peer_dict = {
-                'public_key': peer.public_key,
-                'pre_shared_key': peer.pre_shared_key,
-                'ipv4_address': peer.ipv4_address,
-                'ipv6_address': peer.ipv6_address,
-                'allowed_ips': peer.allowed_ips,
-                'persistent_keepalive': peer.persistent_keepalive
-            }
-            config_lines.append(wg.generate_server_peer_config(peer_dict, interface['public_key']))
-            config_lines.append("")
-        
-        config = "\n".join(config_lines)
-        
-        # Save config file
-        wg.save_config_file(config)
-        
-        # Sync configuration
-        wg.sync_config()
-        
-    except PermissionError:
-        # If we don't have permission, just log the error
-        # In production, the API should run with appropriate permissions
-        print("Warning: Cannot update WireGuard config - permission denied")
-    except Exception as e:
-        print(f"Warning: Failed to update WireGuard config: {str(e)}")
-

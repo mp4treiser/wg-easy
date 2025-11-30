@@ -204,17 +204,137 @@ class WireGuardManager:
         
         return config
 
-    def save_config_file(self, config: str):
-        """Save configuration to WireGuard config file"""
-        config_path = f"/etc/wireguard/{self.interface_name}.conf"
+    def get_interface_info(self) -> Optional[Dict]:
+        """Get WireGuard interface information"""
         try:
-            with open(config_path, 'w') as f:
-                f.write(config)
-            # Set proper permissions
+            output = self._exec(f"{self.wg_executable} show {self.interface_name}")
+            lines = output.strip().split('\n')
+            
+            interface_info = {
+                'name': self.interface_name,
+                'public_key': None,
+                'listening_port': None
+            }
+            
+            for line in lines:
+                if 'public key:' in line:
+                    interface_info['public_key'] = line.split('public key:')[1].strip()
+                elif 'listening port:' in line:
+                    interface_info['listening_port'] = int(line.split('listening port:')[1].strip())
+            
+            return interface_info if interface_info['public_key'] else None
+        except Exception:
+            return None
+    
+    def add_peer(self, public_key: str, allowed_ips: List[str], 
+                 pre_shared_key: Optional[str] = None, 
+                 persistent_keepalive: Optional[int] = None) -> bool:
+        """Add a peer to WireGuard interface using wg set"""
+        try:
+            import subprocess
+            import tempfile
             import os
-            os.chmod(config_path, 0o600)
-        except PermissionError:
-            raise Exception(f"Permission denied: Need root access to write to {config_path}")
+            
+            # First add the peer
+            self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key}")
+            
+            # Set preshared key if provided
+            if pre_shared_key:
+                # Create temporary file for preshared key
+                with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+                    f.write(pre_shared_key)
+                    temp_file = f.name
+                
+                try:
+                    self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} preshared-key {temp_file}")
+                finally:
+                    os.unlink(temp_file)
+            
+            # Set allowed IPs
+            if allowed_ips:
+                allowed_ips_str = ','.join(allowed_ips)
+                self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} allowed-ips {allowed_ips_str}")
+            
+            # Set persistent keepalive
+            if persistent_keepalive:
+                self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} persistent-keepalive {persistent_keepalive}")
+            
+            return True
         except Exception as e:
-            raise Exception(f"Failed to save config: {str(e)}")
+            raise Exception(f"Failed to add peer: {str(e)}")
+    
+    def remove_peer(self, public_key: str) -> bool:
+        """Remove a peer from WireGuard interface"""
+        try:
+            self._exec(f"{self.wg_executable} set {self.interface_name} peer {public_key} remove")
+            return True
+        except Exception as e:
+            raise Exception(f"Failed to remove peer: {str(e)}")
+    
+    def get_next_available_ip(self, cidr: str = "10.8.0.0/24") -> str:
+        """Get next available IP address from CIDR"""
+        try:
+            # Get all existing peers
+            peers = self.dump_peers()
+            existing_ips = set()
+            
+            for peer in peers:
+                if peer.get('ipv4_address'):
+                    existing_ips.add(peer['ipv4_address'])
+            
+            # Parse CIDR
+            base_ip, prefix = cidr.split('/')
+            prefix = int(prefix)
+            base_parts = base_ip.split('.')
+            base_network = f"{base_parts[0]}.{base_parts[1]}.{base_parts[2]}"
+            
+            # Find next available IP (starting from .2, as .1 is usually the server)
+            for i in range(2, 255):
+                ip = f"{base_network}.{i}"
+                if ip not in existing_ips:
+                    return ip
+            
+            raise Exception("No available IPv4 addresses")
+        except Exception as e:
+            raise Exception(f"Failed to get next IP: {str(e)}")
+    
+    def read_config_file(self) -> Optional[Dict]:
+        """Read WireGuard config file to get interface details"""
+        try:
+            config_path = f"/etc/wireguard/{self.interface_name}.conf"
+            with open(config_path, 'r') as f:
+                content = f.read()
+            
+            config = {
+                'name': self.interface_name,
+                'private_key': None,
+                'public_key': None,
+                'address': None,
+                'listen_port': None,
+                'dns': None,
+                'endpoint': None
+            }
+            
+            # Parse config file
+            for line in content.split('\n'):
+                line = line.strip()
+                if line.startswith('PrivateKey'):
+                    config['private_key'] = line.split('=', 1)[1].strip()
+                elif line.startswith('Address'):
+                    config['address'] = line.split('=', 1)[1].strip()
+                elif line.startswith('ListenPort'):
+                    config['listen_port'] = int(line.split('=', 1)[1].strip())
+                elif line.startswith('DNS'):
+                    config['dns'] = line.split('=', 1)[1].strip()
+            
+            # Get public key from interface if available
+            interface_info = self.get_interface_info()
+            if interface_info and interface_info.get('public_key'):
+                config['public_key'] = interface_info['public_key']
+            
+            return config
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            return None
 

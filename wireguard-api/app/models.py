@@ -26,49 +26,40 @@ class PeerMetrics(BaseModel):
 
 
 class PeerConfig(BaseModel):
-    private_key: str
+    private_key: Optional[str] = None  # Only if peer was created via this API
     public_key: str
-    pre_shared_key: str
-    ipv4_address: str
+    pre_shared_key: Optional[str] = None  # Only if peer was created via this API
+    ipv4_address: Optional[str] = None
     ipv6_address: Optional[str] = None
     allowed_ips: List[str]
-    persistent_keepalive: int
+    persistent_keepalive: Optional[int] = None
     server_public_key: str
-    server_endpoint: str
+    server_endpoint: Optional[str] = None
     server_port: int
     dns: Optional[List[str]] = None
 
 
 class Peer(PeerBase):
-    id: int
     public_key: str
-    private_key: str
-    pre_shared_key: str
+    private_key: Optional[str] = None  # Only available when peer is created via API
+    pre_shared_key: Optional[str] = None  # Only available when peer is created via API
     enabled: bool = True
-    created_at: datetime
-    updated_at: datetime
     metrics: Optional[PeerMetrics] = None
-
-    class Config:
-        from_attributes = True
 
 
 class PeerResponse(BaseModel):
-    id: int
-    name: str
     public_key: str
-    ipv4_address: str
-    ipv6_address: Optional[str]
-    enabled: bool
-    created_at: datetime
-    updated_at: datetime
+    name: Optional[str] = None
+    ipv4_address: Optional[str] = None
+    ipv6_address: Optional[str] = None
+    allowed_ips: List[str] = []
+    enabled: bool = True
     metrics: Optional[PeerMetrics] = None
 
 
 class MetricsResponse(BaseModel):
-    peer_id: int
-    peer_name: str
     public_key: str
+    peer_name: Optional[str] = None
     endpoint: Optional[str]
     latest_handshake: Optional[datetime]
     transfer_rx: int
@@ -83,4 +74,9 @@ class AllMetricsResponse(BaseModel):
     enabled_peers: int
     connected_peers: int
     peers: List[MetricsResponse]
+
+
+# Store for peer keys created via API (in-memory, lost on restart)
+# This is only for peers created through this API
+peer_keys_store: dict = {}  # public_key -> {private_key, pre_shared_key, name}
 

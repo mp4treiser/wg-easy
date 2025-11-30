@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, status
 from typing import Optional
 from pydantic import BaseModel
-from app.database import db
 from app.utils.wireguard import WireGuardManager
 
 router = APIRouter()
@@ -19,58 +18,38 @@ class InterfaceConfig(BaseModel):
 
 @router.get("/interface")
 async def get_interface_config():
-    """Get WireGuard interface configuration"""
-    interface = await db.get_interface()
-    if not interface:
+    """Get WireGuard interface configuration (reads from WireGuard and config file)"""
+    interface_info = wg.get_interface_info()
+    config = wg.read_config_file()
+    
+    if not interface_info:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Interface not configured. Please initialize it first."
+            detail="WireGuard interface not found or not running"
         )
     
-    # Don't expose private key in response
-    return {
-        "name": interface.get('name', 'wg0'),
-        "public_key": interface.get('public_key'),
-        "port": interface.get('port'),
-        "ipv4_cidr": interface.get('ipv4_cidr'),
-        "endpoint": interface.get('endpoint'),
-        "dns": interface.get('dns')
+    result = {
+        "name": interface_info.get('name', 'wg0'),
+        "public_key": interface_info.get('public_key'),
+        "listening_port": interface_info.get('listening_port'),
     }
+    
+    # Add info from config file if available
+    if config:
+        if config.get('address'):
+            result['address'] = config['address']
+        if config.get('dns'):
+            result['dns'] = config['dns']
+    
+    return result
 
 
 @router.post("/interface")
 async def init_interface(config: InterfaceConfig):
-    """Initialize or update WireGuard interface configuration"""
-    try:
-        existing = await db.get_interface()
-        
-        if existing and (config.private_key or config.public_key):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Interface already exists. Cannot change keys."
-            )
-        
-        # Generate keys if not provided
-        private_key = config.private_key or wg.generate_private_key()
-        public_key = config.public_key or wg.get_public_key(private_key)
-        
-        await db.init_interface(
-            private_key=private_key,
-            public_key=public_key,
-            port=config.port,
-            ipv4_cidr=config.ipv4_cidr,
-            endpoint=config.endpoint,
-            dns=config.dns
-        )
-        
-        return {
-            "message": "Interface initialized successfully",
-            "public_key": public_key,
-            "port": config.port
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to initialize interface: {str(e)}"
-        )
-
+    """Initialize WireGuard interface configuration"""
+    # This endpoint is kept for compatibility, but interface should be managed by wg-easy
+    # We can't create interface here as it's already managed by wg-easy
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Interface is managed by wg-easy. Please configure it through wg-easy web interface."
+    )
