@@ -62,14 +62,29 @@ async def create_peer(peer: PeerCreate):
             persistent_keepalive=peer.persistent_keepalive
         )
         
-        # Store keys in memory (only for peers created via this API)
+        # Save peer to wg-easy database
+        import json
+        peer_db_data = {
+            'public_key': public_key,
+            'private_key': private_key,
+            'pre_shared_key': pre_shared_key,
+            'name': peer.name,
+            'ipv4_address': ipv4_address,
+            'ipv6_address': peer.ipv6_address or '',
+            'allowed_ips': client_allowed_ips,
+            'server_allowed_ips': server_allowed_ips,
+            'persistent_keepalive': peer.persistent_keepalive or 25
+        }
+        wg.save_peer_to_db(peer_db_data)
+        
+        # Also store in memory for backward compatibility
         peer_keys_store[public_key] = {
             'private_key': private_key,
             'pre_shared_key': pre_shared_key,
             'name': peer.name,
             'ipv4_address': ipv4_address,
             'ipv6_address': peer.ipv6_address,
-            'allowed_ips': client_allowed_ips  # Store client allowed_ips for config generation
+            'allowed_ips': client_allowed_ips
         }
         
         # Get metrics if available
@@ -112,17 +127,30 @@ async def list_peers():
             public_key = wg_peer['public_key']
             metrics = wg.get_peer_metrics(public_key)
             
-            # Get name from store if peer was created via this API
+            # Try to get name from database first, then from memory store
+            db_peer = wg.get_peer_from_db(public_key)
             stored_keys = peer_keys_store.get(public_key, {})
-            name = stored_keys.get('name') or f"peer-{public_key[:8]}"
+            
+            if db_peer:
+                name = db_peer.get('name') or stored_keys.get('name') or f"peer-{public_key[:8]}"
+                ipv4_address = db_peer.get('ipv4_address') or stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address')
+                ipv6_address = db_peer.get('ipv6_address') or stored_keys.get('ipv6_address') or wg_peer.get('ipv6_address')
+                private_key = db_peer.get('private_key') or stored_keys.get('private_key')
+                pre_shared_key = db_peer.get('pre_shared_key') or stored_keys.get('pre_shared_key')
+            else:
+                name = stored_keys.get('name') or f"peer-{public_key[:8]}"
+                ipv4_address = stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address')
+                ipv6_address = stored_keys.get('ipv6_address') or wg_peer.get('ipv6_address')
+                private_key = stored_keys.get('private_key')
+                pre_shared_key = stored_keys.get('pre_shared_key')
             
             peer_response = PeerResponse(
                 public_key=public_key,
-                private_key=stored_keys.get('private_key'),
-                pre_shared_key=stored_keys.get('pre_shared_key'),
+                private_key=private_key,
+                pre_shared_key=pre_shared_key,
                 name=name,
-                ipv4_address=stored_keys.get('ipv4_address') or wg_peer.get('ipv4_address'),
-                ipv6_address=stored_keys.get('ipv6_address') or wg_peer.get('ipv6_address'),
+                ipv4_address=ipv4_address,
+                ipv6_address=ipv6_address,
                 allowed_ips=wg_peer.get('allowed_ips', []),
                 enabled=True,
                 metrics=metrics
@@ -164,17 +192,30 @@ async def get_peer_by_key(public_key: str):
     
     metrics = wg.get_peer_metrics(public_key)
     
-    # Get name from store if peer was created via this API
+    # Try to get data from database first, then from memory store
+    db_peer = wg.get_peer_from_db(public_key)
     stored_keys = peer_keys_store.get(public_key, {})
-    name = stored_keys.get('name') or f"peer-{public_key[:8]}"
+    
+    if db_peer:
+        name = db_peer.get('name') or stored_keys.get('name') or f"peer-{public_key[:8]}"
+        ipv4_address = db_peer.get('ipv4_address') or stored_keys.get('ipv4_address') or peer_data.get('ipv4_address')
+        ipv6_address = db_peer.get('ipv6_address') or stored_keys.get('ipv6_address') or peer_data.get('ipv6_address')
+        private_key = db_peer.get('private_key') or stored_keys.get('private_key')
+        pre_shared_key = db_peer.get('pre_shared_key') or stored_keys.get('pre_shared_key')
+    else:
+        name = stored_keys.get('name') or f"peer-{public_key[:8]}"
+        ipv4_address = stored_keys.get('ipv4_address') or peer_data.get('ipv4_address')
+        ipv6_address = stored_keys.get('ipv6_address') or peer_data.get('ipv6_address')
+        private_key = stored_keys.get('private_key')
+        pre_shared_key = stored_keys.get('pre_shared_key')
     
     return PeerResponse(
         public_key=public_key,
-        private_key=stored_keys.get('private_key'),
-        pre_shared_key=stored_keys.get('pre_shared_key'),
+        private_key=private_key,
+        pre_shared_key=pre_shared_key,
         name=name,
-        ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
-        ipv6_address=stored_keys.get('ipv6_address') or peer_data.get('ipv6_address'),
+        ipv4_address=ipv4_address,
+        ipv6_address=ipv6_address,
         allowed_ips=peer_data.get('allowed_ips', []),
         enabled=True,
         metrics=metrics
@@ -191,6 +232,8 @@ async def delete_peer(public_key: str):
     
     try:
         wg.remove_peer(public_key)
+        # Remove from wg-easy database
+        wg.delete_peer_from_db(public_key)
         # Remove from keys store if exists
         if public_key in peer_keys_store:
             del peer_keys_store[public_key]
@@ -247,11 +290,24 @@ async def get_peer_config(public_key: str):
     if config and config.get('dns'):
         dns = [d.strip() for d in config['dns'].split(',')]
     
-    # Check if we have keys in store (peer created via this API)
+    # Try to get keys from database first, then from memory store
+    db_peer = wg.get_peer_from_db(public_key)
     stored_keys = peer_keys_store.get(public_key, {})
     
+    # Merge database data with memory store
+    if db_peer:
+        import json
+        stored_keys = {
+            'private_key': db_peer.get('private_key') or stored_keys.get('private_key'),
+            'pre_shared_key': db_peer.get('pre_shared_key') or stored_keys.get('pre_shared_key'),
+            'name': db_peer.get('name') or stored_keys.get('name'),
+            'ipv4_address': db_peer.get('ipv4_address') or stored_keys.get('ipv4_address'),
+            'ipv6_address': db_peer.get('ipv6_address') or stored_keys.get('ipv6_address'),
+            'allowed_ips': json.loads(db_peer.get('allowed_ips', '[]')) if db_peer.get('allowed_ips') else stored_keys.get('allowed_ips', ['0.0.0.0/0'])
+        }
+    
     return PeerConfig(
-        private_key=stored_keys.get('private_key'),  # Only if created via this API
+        private_key=stored_keys.get('private_key'),  # From database or memory store
         public_key=public_key,
         pre_shared_key=stored_keys.get('pre_shared_key') or peer_data.get('pre_shared_key'),
         ipv4_address=stored_keys.get('ipv4_address') or peer_data.get('ipv4_address'),
@@ -304,8 +360,21 @@ async def get_peer_config_text(public_key: str):
             detail="WireGuard interface configuration not found"
         )
     
-    # Check if we have keys in store (peer created via this API)
+    # Try to get keys from database first, then from memory store
+    db_peer = wg.get_peer_from_db(public_key)
     stored_keys = peer_keys_store.get(public_key, {})
+    
+    # Merge database data with memory store
+    if db_peer:
+        import json
+        stored_keys = {
+            'private_key': db_peer.get('private_key') or stored_keys.get('private_key'),
+            'pre_shared_key': db_peer.get('pre_shared_key') or stored_keys.get('pre_shared_key'),
+            'name': db_peer.get('name') or stored_keys.get('name'),
+            'ipv4_address': db_peer.get('ipv4_address') or stored_keys.get('ipv4_address'),
+            'ipv6_address': db_peer.get('ipv6_address') or stored_keys.get('ipv6_address'),
+            'allowed_ips': json.loads(db_peer.get('allowed_ips', '[]')) if db_peer.get('allowed_ips') else stored_keys.get('allowed_ips', ['0.0.0.0/0'])
+        }
     
     if stored_keys.get('private_key'):
         # Generate full client config
@@ -385,13 +454,26 @@ async def get_peer_qrcode(public_key: str, format: str = "png"):
             detail="WireGuard interface configuration not found"
         )
     
-    # Check if we have keys in store (peer created via this API)
+    # Try to get keys from database first, then from memory store
+    db_peer = wg.get_peer_from_db(public_key)
     stored_keys = peer_keys_store.get(public_key, {})
+    
+    # Merge database data with memory store (database takes precedence)
+    if db_peer:
+        import json
+        stored_keys = {
+            'private_key': db_peer.get('private_key') or stored_keys.get('private_key'),
+            'pre_shared_key': db_peer.get('pre_shared_key') or stored_keys.get('pre_shared_key'),
+            'name': db_peer.get('name') or stored_keys.get('name'),
+            'ipv4_address': db_peer.get('ipv4_address') or stored_keys.get('ipv4_address'),
+            'ipv6_address': db_peer.get('ipv6_address') or stored_keys.get('ipv6_address'),
+            'allowed_ips': json.loads(db_peer.get('allowed_ips', '[]')) if db_peer.get('allowed_ips') else stored_keys.get('allowed_ips', ['0.0.0.0/0'])
+        }
     
     if not stored_keys.get('private_key'):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="QR code is only available for peers created via this API. Private key is required."
+            detail="QR code is not available. Private key not found in database."
         )
     
     # Generate client config

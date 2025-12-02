@@ -1,6 +1,8 @@
 import subprocess
 import re
 import logging
+import sqlite3
+import os
 from typing import Optional, List, Dict
 from datetime import datetime
 from app.models import PeerMetrics
@@ -13,12 +15,13 @@ logging.basicConfig(level=logging.DEBUG)
 class WireGuardManager:
     def __init__(self, interface_name: str = "wg0", wg_executable: str = "wg", 
                  wg_container: str = None):
-        import os
         self.interface_name = interface_name
         self.wg_executable = wg_executable
         # Get container name from environment or use default
         self.wg_container = wg_container or os.getenv("WG_CONTAINER", "wg-easy")
-        logger.info(f"WireGuardManager initialized with interface={interface_name}, executable={wg_executable}, container={self.wg_container}")
+        # wg-easy database path (shared volume)
+        self.wg_easy_db_path = "/etc/wireguard/wg-easy.db"
+        logger.info(f"WireGuardManager initialized with interface={interface_name}, executable={wg_executable}, container={self.wg_container}, db_path={self.wg_easy_db_path}")
 
     def _exec(self, command: str, use_container: bool = True) -> str:
         """Execute shell command and return output"""
@@ -595,4 +598,168 @@ class WireGuardManager:
             return None
         except Exception as e:
             return None
+    
+    def _get_db_connection(self):
+        """Get SQLite connection to wg-easy database"""
+        try:
+            if not os.path.exists(self.wg_easy_db_path):
+                logger.warning(f"wg-easy database not found at {self.wg_easy_db_path}")
+                return None
+            conn = sqlite3.connect(self.wg_easy_db_path)
+            conn.row_factory = sqlite3.Row  # Return rows as dict-like objects
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to connect to wg-easy database: {e}")
+            return None
+    
+    def get_peer_from_db(self, public_key: str) -> Optional[Dict]:
+        """Get peer information from wg-easy database by public_key"""
+        conn = self._get_db_connection()
+        if not conn:
+            return None
+        
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM clients_table WHERE public_key = ?",
+                (public_key,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get peer from database: {e}")
+            return None
+        finally:
+            conn.close()
+    
+    def save_peer_to_db(self, peer_data: Dict) -> bool:
+        """Save peer to wg-easy database"""
+        conn = self._get_db_connection()
+        if not conn:
+            logger.warning("Cannot save peer to database: connection failed")
+            return False
+        
+        try:
+            cursor = conn.cursor()
+            
+            # Check if peer already exists
+            cursor.execute(
+                "SELECT id FROM clients_table WHERE public_key = ?",
+                (peer_data['public_key'],)
+            )
+            existing = cursor.fetchone()
+            
+            if existing:
+                # Update existing peer
+                cursor.execute("""
+                    UPDATE clients_table SET
+                        name = ?,
+                        ipv4_address = ?,
+                        ipv6_address = ?,
+                        private_key = ?,
+                        pre_shared_key = ?,
+                        allowed_ips = ?,
+                        server_allowed_ips = ?,
+                        persistent_keepalive = ?,
+                        enabled = 1,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE public_key = ?
+                """, (
+                    peer_data.get('name', ''),
+                    peer_data.get('ipv4_address', ''),
+                    peer_data.get('ipv6_address', ''),
+                    peer_data.get('private_key', ''),
+                    peer_data.get('pre_shared_key', ''),
+                    peer_data.get('allowed_ips', '[]'),  # JSON string
+                    peer_data.get('server_allowed_ips', '[]'),  # JSON string
+                    peer_data.get('persistent_keepalive', 25),
+                    peer_data['public_key']
+                ))
+            else:
+                # Insert new peer
+                # First, get user_id and interface_id
+                cursor.execute("SELECT id FROM users_table LIMIT 1")
+                user_row = cursor.fetchone()
+                if not user_row:
+                    logger.error("No user found in database")
+                    return False
+                user_id = user_row[0]
+                
+                cursor.execute("SELECT name FROM interfaces_table WHERE name = ?", (self.interface_name,))
+                interface_row = cursor.fetchone()
+                if not interface_row:
+                    logger.error(f"Interface {self.interface_name} not found in database")
+                    return False
+                interface_id = interface_row[0]
+                
+                # Get default values from userConfig
+                cursor.execute("SELECT * FROM user_config_table WHERE id = ?", (self.interface_name,))
+                user_config = cursor.fetchone()
+                
+                default_mtu = 1420
+                if user_config:
+                    default_mtu = user_config.get('mtu', 1420) if hasattr(user_config, 'get') else 1420
+                
+                import json
+                allowed_ips_json = json.dumps(peer_data.get('allowed_ips', ['0.0.0.0/0']))
+                server_allowed_ips_json = json.dumps(peer_data.get('server_allowed_ips', [f"{peer_data.get('ipv4_address', '')}/32"]))
+                
+                cursor.execute("""
+                    INSERT INTO clients_table (
+                        user_id, interface_id, name, ipv4_address, ipv6_address,
+                        private_key, public_key, pre_shared_key,
+                        allowed_ips, server_allowed_ips, persistent_keepalive,
+                        mtu, enabled, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (
+                    user_id,
+                    interface_id,
+                    peer_data.get('name', ''),
+                    peer_data.get('ipv4_address', ''),
+                    peer_data.get('ipv6_address', ''),
+                    peer_data.get('private_key', ''),
+                    peer_data['public_key'],
+                    peer_data.get('pre_shared_key', ''),
+                    allowed_ips_json,
+                    server_allowed_ips_json,
+                    peer_data.get('persistent_keepalive', 25),
+                    default_mtu
+                ))
+            
+            conn.commit()
+            logger.info(f"Peer {peer_data['public_key'][:8]}... saved to database")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save peer to database: {e}", exc_info=True)
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def delete_peer_from_db(self, public_key: str) -> bool:
+        """Delete peer from wg-easy database"""
+        conn = self._get_db_connection()
+        if not conn:
+            logger.warning("Cannot delete peer from database: connection failed")
+            return False
+        
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM clients_table WHERE public_key = ?",
+                (public_key,)
+            )
+            conn.commit()
+            deleted = cursor.rowcount > 0
+            if deleted:
+                logger.info(f"Peer {public_key[:8]}... deleted from database")
+            return deleted
+        except Exception as e:
+            logger.error(f"Failed to delete peer from database: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
 
